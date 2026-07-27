@@ -137,7 +137,7 @@ class VitMatteRefiner:
         with torch.no_grad():
             predictions = self.model(**inputs).alphas
 
-        alpha = predictions[0, 0].detach().cpu().numpy()
+        alpha = predictions[0, 0].detach().float().cpu().numpy()
         alpha = alpha[: image_resized.height, : image_resized.width]
 
         if image_resized.size != image_pil.size:

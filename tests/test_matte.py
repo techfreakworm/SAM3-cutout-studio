@@ -149,7 +149,12 @@ def test_refine_lazily_loads_once_and_normalizes_uint8_masks(monkeypatch) -> Non
         def __call__(self, **inputs):
             self.call_count += 1
             height, width = next(iter(inputs.values())).shape[-2:]
-            alphas = torch.linspace(0.0, 1.0, height * width).reshape(1, 1, height, width)
+            alphas = torch.linspace(
+                0.0,
+                1.0,
+                height * width,
+                dtype=torch.bfloat16,
+            ).reshape(1, 1, height, width)
             return type("Prediction", (), {"alphas": alphas})()
 
     processor = FakeProcessor()
@@ -188,7 +193,7 @@ def test_refine_lazily_loads_once_and_normalizes_uint8_masks(monkeypatch) -> Non
         record["trimap"],
         np.array([[0, 0, 255], [255, 0, 255]], dtype=np.uint8),
     )
-    expected_alpha = np.linspace(0.0, 1.0, 6, dtype=np.float32).reshape(2, 3)
+    expected_alpha = torch.linspace(0.0, 1.0, 6, dtype=torch.bfloat16).float().numpy().reshape(2, 3)
     np.testing.assert_allclose(first_alpha, expected_alpha)
     np.testing.assert_allclose(second_alpha, expected_alpha)
     assert model.device == "cpu"
