@@ -3,9 +3,9 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sam3-matte-studio"
+name = "sam3-cutout-studio"
 version = "0.1.0"
-description = "Text-guided video background removal with SAM 3.1 and ViTMatte"
+description = "Text-guided video cutouts with SAM 3.1 and ViTMatte"
 requires-python = ">=3.12,<3.13"
 license = { text = "MIT" }
 dependencies = []

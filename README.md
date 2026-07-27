@@ -1,5 +1,5 @@
 ---
-title: SAM3 Pro Matte Studio
+title: SAM3 Cutout Studio
 emoji: 🎬
 colorFrom: gray
 colorTo: yellow
@@ -14,9 +14,9 @@ models:
   - hustvl/vitmatte-small-composition-1k
 ---
 
-# SAM3 Pro Matte Studio
+# SAM3 Cutout Studio
 
-Text-guided video background removal using SAM 3.1 Object Multiplex tracking and ViTMatte alpha refinement. The application is a Gradio-only project designed for local CUDA, Hugging Face ZeroGPU, and an MPS pathway for high-memory Apple-silicon Macs.
+Text-guided video cutouts using SAM 3.1 Object Multiplex tracking and ViTMatte alpha refinement. The application is a Gradio-only studio designed for local CUDA, Hugging Face ZeroGPU, and an MPS pathway for high-memory Apple-silicon Macs.
 
 The source of truth is this public GitHub repository. Model weights are downloaded from their upstream repositories and retain their upstream licenses.
 
