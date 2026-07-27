@@ -160,12 +160,12 @@ def test_refine_lazily_loads_once_and_normalizes_uint8_masks(monkeypatch) -> Non
     processor = FakeProcessor()
     model = FakeModel()
 
-    def load_processor(model_id):
-        record["processor_loads"].append(model_id)
+    def load_processor(model_id, **kwargs):
+        record["processor_loads"].append((model_id, kwargs))
         return processor
 
-    def load_model(model_id):
-        record["model_loads"].append(model_id)
+    def load_model(model_id, **kwargs):
+        record["model_loads"].append((model_id, kwargs))
         return model
 
     monkeypatch.setattr(VitMatteImageProcessor, "from_pretrained", staticmethod(load_processor))
@@ -186,8 +186,9 @@ def test_refine_lazily_loads_once_and_normalizes_uint8_masks(monkeypatch) -> Non
     second_alpha = refiner.refine(image, mask)
 
     model_id = "hustvl/vitmatte-small-composition-1k"
-    assert record["processor_loads"] == [model_id]
-    assert record["model_loads"] == [model_id]
+    revision = "6a58ad7646403c1df626fbd746900aec7361ea1d"
+    assert record["processor_loads"] == [(model_id, {"revision": revision})]
+    assert record["model_loads"] == [(model_id, {"revision": revision})]
     assert record["image_mode"] == "RGB"
     np.testing.assert_array_equal(
         record["trimap"],

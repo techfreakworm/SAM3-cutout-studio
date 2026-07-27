@@ -3,6 +3,7 @@
 import contextlib
 import inspect
 import io
+import logging
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -13,6 +14,8 @@ import numpy as np
 
 from .base import BackendProtocolError, SamVideoBackend, TrackedFrame
 from .checkpoint_schema import partition_sam31_missing_keys
+
+logger = logging.getLogger(__name__)
 
 _REQUIRED_OUTPUT_FIELDS = frozenset(
     {
@@ -48,30 +51,34 @@ def _build_safetensors_predictor(
                 **builder_kwargs,
             )
 
-    missing_keys, unexpected_keys = load_model(
-        predictor.model,
-        checkpoint_path,
-        strict=False,
-        device="cpu",
-    )
-    allowed_missing, blocking_missing = partition_sam31_missing_keys(missing_keys)
-    if blocking_missing:
-        preview = ", ".join(blocking_missing[:5])
-        raise CheckpointCompatibilityError(f"checkpoint is missing learned keys: {preview}")
-    if unexpected_keys:
-        preview = ", ".join(sorted(unexpected_keys)[:5])
-        raise CheckpointCompatibilityError(f"checkpoint has unexpected keys: {preview}")
+    try:
+        missing_keys, unexpected_keys = load_model(
+            predictor.model,
+            checkpoint_path,
+            strict=False,
+            device="cpu",
+        )
+        allowed_missing, blocking_missing = partition_sam31_missing_keys(missing_keys)
+        if blocking_missing:
+            preview = ", ".join(blocking_missing[:5])
+            raise CheckpointCompatibilityError(f"checkpoint is missing learned keys: {preview}")
+        if unexpected_keys:
+            preview = ", ".join(sorted(unexpected_keys)[:5])
+            raise CheckpointCompatibilityError(f"checkpoint has unexpected keys: {preview}")
 
-    text_projection_key = "detector.backbone.language_backbone.encoder.text_projection"
-    if text_projection_key in allowed_missing:
-        try:
-            text_projection = predictor.model.detector.backbone.language_backbone.encoder.text_projection
-        except AttributeError as exc:
-            raise CheckpointCompatibilityError(
-                "could not initialize the absent Meta text_projection"
-            ) from exc
-        with torch.no_grad():
-            text_projection.zero_()
+        text_projection_key = "detector.backbone.language_backbone.encoder.text_projection"
+        if text_projection_key in allowed_missing:
+            try:
+                text_projection = predictor.model.detector.backbone.language_backbone.encoder.text_projection
+            except AttributeError as exc:
+                raise CheckpointCompatibilityError(
+                    "could not initialize the absent Meta text_projection"
+                ) from exc
+            with torch.no_grad():
+                text_projection.zero_()
+    except BaseException:
+        _cleanup_upstream_autocast_after_build_failure(predictor)
+        raise
 
     return predictor
 
@@ -118,18 +125,87 @@ def _default_predictor_builder(**kwargs: object) -> object:
         )
     else:
         predictor = build_sam3_multiplex_video_predictor(**kwargs)
-    return _adapt_legacy_state_offload(predictor)
+    try:
+        return _adapt_legacy_state_offload(predictor)
+    except BaseException:
+        _cleanup_upstream_autocast_after_build_failure(predictor)
+        raise
 
 
 @contextmanager
-def _temporary_detection_threshold(predictor: object, threshold: float) -> Iterator[None]:
+def _cuda_bfloat16_autocast() -> Iterator[None]:
+    import torch
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        yield
+
+
+def _exit_upstream_autocast_contexts(predictor: object) -> None:
+    """Undo lifetime autocast contexts entered by the pinned Meta constructors."""
+    model = getattr(predictor, "model", None)
+    tracker = getattr(model, "tracker", None)
+    tracker_model = getattr(tracker, "model", None)
+
+    # The pinned multiplex graph owns contexts on predictor and tracker. Keep
+    # tracker_model support for the older three-owner graph used by legacy builds.
+    seen_contexts: set[int] = set()
+    exit_errors: list[BaseException] = []
+    for owner in (predictor, tracker, tracker_model):
+        context = getattr(owner, "bf16_context", None)
+        context_id = id(context)
+        if context is None or context_id in seen_contexts:
+            continue
+        seen_contexts.add(context_id)
+        exit_context = getattr(context, "__exit__", None)
+        if not callable(exit_context):
+            continue
+        try:
+            exit_context(None, None, None)
+        except BaseException as exc:
+            exit_errors.append(exc)
+
+    if exit_errors:
+        for secondary_error in exit_errors[1:]:
+            logger.error(
+                "additional upstream autocast context failed to exit",
+                exc_info=(
+                    type(secondary_error),
+                    secondary_error,
+                    secondary_error.__traceback__,
+                ),
+            )
+        raise exit_errors[0]
+
+
+def _cleanup_upstream_autocast_after_build_failure(predictor: object) -> None:
+    """Best-effort unwind without replacing the active predictor-build error."""
+    try:
+        _exit_upstream_autocast_contexts(predictor)
+    except BaseException:
+        logger.exception("autocast cleanup failed while preserving predictor build error")
+
+
+@contextmanager
+def _temporary_tracking_settings(
+    predictor: object,
+    *,
+    detection_threshold: float,
+    detect_interval: int,
+    max_objects: int,
+) -> Iterator[None]:
     model = getattr(predictor, "model", None)
     original_values: dict[str, object] = {}
     if model is not None:
-        for attribute in ("new_det_thresh", "score_threshold_detection"):
+        requested_values = {
+            "new_det_thresh": detection_threshold,
+            "score_threshold_detection": detection_threshold,
+            "recondition_every_nth_frame": detect_interval,
+            "max_num_objects": max_objects,
+        }
+        for attribute, requested_value in requested_values.items():
             if hasattr(model, attribute):
                 original_values[attribute] = getattr(model, attribute)
-                setattr(model, attribute, threshold)
+                setattr(model, attribute, requested_value)
     try:
         yield
     finally:
@@ -209,22 +285,27 @@ class MetaSam31Backend(SamVideoBackend):
         self.device = device
         self._predictor_builder = predictor_builder or _default_predictor_builder
         self._predictor: object | None = None
+        self._predictor_load_lock = Lock()
         self._inference_lock = Lock()
 
     def _get_predictor(self) -> object:
         if self._predictor is None:
-            self._predictor = self._predictor_builder(
-                checkpoint_path=self.checkpoint_path,
-                max_num_objects=self.max_objects,
-                multiplex_count=16,
-                use_fa3=False,
-                use_rope_real=True,
-                compile=False,
-                warm_up=False,
-                session_expiration_sec=1200,
-                default_output_prob_thresh=0.5,
-                async_loading_frames=True,
-            )
+            with self._predictor_load_lock:
+                if self._predictor is None:
+                    predictor = self._predictor_builder(
+                        checkpoint_path=self.checkpoint_path,
+                        max_num_objects=self.max_objects,
+                        multiplex_count=16,
+                        use_fa3=False,
+                        use_rope_real=True,
+                        compile=False,
+                        warm_up=False,
+                        session_expiration_sec=1200,
+                        default_output_prob_thresh=0.5,
+                        async_loading_frames=True,
+                    )
+                    _exit_upstream_autocast_contexts(predictor)
+                    self._predictor = predictor
         return self._predictor
 
     def track(
@@ -233,63 +314,99 @@ class MetaSam31Backend(SamVideoBackend):
         *,
         prompt: str,
         detection_threshold: float = 0.5,
+        detect_interval: int = 1,
+        max_objects: int = 8,
     ) -> Iterator[TrackedFrame]:
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
         if not 0.0 <= detection_threshold <= 1.0:
             raise ValueError("detection_threshold must be between 0 and 1")
+        if detect_interval < 1:
+            raise ValueError("detect_interval must be at least 1")
+        if not 1 <= max_objects <= 8:
+            raise ValueError("max_objects must be between 1 and 8")
 
+        # Meta's constructors enter lifetime autocast contexts on their construction
+        # thread. _get_predictor unwinds those; each CUDA operation below receives a
+        # fresh request-thread context that exits before control is yielded.
         with self._inference_lock:
             predictor = self._get_predictor()
-            start_response = predictor.handle_request(
-                {
-                    "type": "start_session",
-                    "resource_path": str(video_path),
-                    "offload_video_to_cpu": True,
-                    "offload_state_to_cpu": False,
-                }
-            )
-            if not isinstance(start_response, Mapping) or not isinstance(
-                start_response.get("session_id"), str
+            with _temporary_tracking_settings(
+                predictor,
+                detection_threshold=detection_threshold,
+                detect_interval=detect_interval,
+                max_objects=max_objects,
             ):
-                raise BackendProtocolError("Meta predictor start_session requires a session_id")
-            session_id = start_response["session_id"]
-
-            try:
-                with _temporary_detection_threshold(predictor, detection_threshold):
-                    prompt_response = predictor.handle_request(
+                with _cuda_bfloat16_autocast():
+                    start_response = predictor.handle_request(
                         {
-                            "type": "add_prompt",
-                            "session_id": session_id,
-                            "frame_index": 0,
-                            "text": prompt,
-                            "output_prob_thresh": detection_threshold,
+                            "type": "start_session",
+                            "resource_path": str(video_path),
+                            "offload_video_to_cpu": True,
+                            "offload_state_to_cpu": False,
                         }
                     )
+                if not isinstance(start_response, Mapping) or not isinstance(
+                    start_response.get("session_id"), str
+                ):
+                    raise BackendProtocolError("Meta predictor start_session requires a session_id")
+                session_id = start_response["session_id"]
+
+                def close_session() -> None:
+                    with _cuda_bfloat16_autocast():
+                        predictor.handle_request(
+                            {
+                                "type": "close_session",
+                                "session_id": session_id,
+                                "run_gc_collect": True,
+                            }
+                        )
+
+                try:
+                    with _cuda_bfloat16_autocast():
+                        prompt_response = predictor.handle_request(
+                            {
+                                "type": "add_prompt",
+                                "session_id": session_id,
+                                "frame_index": 0,
+                                "text": prompt,
+                                "output_prob_thresh": detection_threshold,
+                            }
+                        )
                     prompted_frame = _tracked_frame(prompt_response)
                     seen_frame_indices = {prompted_frame.frame_index}
                     yield prompted_frame
 
-                    stream = predictor.handle_stream_request(
-                        {
-                            "type": "propagate_in_video",
-                            "session_id": session_id,
-                            "propagation_direction": "forward",
-                            "start_frame_index": 0,
-                            "output_prob_thresh": detection_threshold,
-                        }
+                    stream = iter(
+                        predictor.handle_stream_request(
+                            {
+                                "type": "propagate_in_video",
+                                "session_id": session_id,
+                                "propagation_direction": "forward",
+                                "start_frame_index": 0,
+                                "output_prob_thresh": detection_threshold,
+                            }
+                        )
                     )
-                    for response in stream:
+                    while True:
+                        try:
+                            with _cuda_bfloat16_autocast():
+                                response = next(stream)
+                        except StopIteration:
+                            break
                         frame = _tracked_frame(response)
                         if frame.frame_index in seen_frame_indices:
                             continue
                         seen_frame_indices.add(frame.frame_index)
                         yield frame
-            finally:
-                predictor.handle_request(
-                    {
-                        "type": "close_session",
-                        "session_id": session_id,
-                        "run_gc_collect": True,
-                    }
-                )
+                except GeneratorExit:
+                    close_session()
+                    raise
+                except BaseException:
+                    try:
+                        close_session()
+                    except BaseException:
+                        logger.exception("close_session failed while preserving the primary inference error")
+                    raise
+                else:
+                    close_session()

@@ -123,14 +123,14 @@ def test_gpu_decorator_is_identity_away_from_zerogpu() -> None:
     assert decorated(2) == 3
 
 
-def test_gpu_decorator_delegates_duration_inside_zerogpu() -> None:
+def test_gpu_decorator_delegates_duration_and_size_inside_zerogpu() -> None:
     from sam3_matting.runtime import gpu
 
-    observed_durations: list[object] = []
+    observed_options: list[dict[str, object]] = []
 
     class FakeSpaces:
-        def GPU(self, *, duration: object):
-            observed_durations.append(duration)
+        def GPU(self, **options: object):
+            observed_options.append(options)
 
             def decorator(function):
                 def wrapped(*args: object, **kwargs: object):
@@ -148,11 +148,12 @@ def test_gpu_decorator_delegates_duration_inside_zerogpu() -> None:
 
     decorated = gpu(
         duration=dynamic_duration,
+        size="xlarge",
         environ={"SPACES_ZERO_GPU_V2": "1"},
         spaces_module=FakeSpaces(),
     )(add_one)
 
-    assert observed_durations == [dynamic_duration]
+    assert observed_options == [{"duration": dynamic_duration, "size": "xlarge"}]
     assert decorated(2) == ("gpu", 3)
 
 

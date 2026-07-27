@@ -35,5 +35,7 @@ class SamVideoBackend(ABC):
         *,
         prompt: str,
         detection_threshold: float = 0.5,
+        detect_interval: int = 1,
+        max_objects: int = 8,
     ) -> Iterator[TrackedFrame]:
         """Yield masks in source-frame order and release backend state on completion."""

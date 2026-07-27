@@ -13,6 +13,7 @@ StudioProcessFn = Callable[
     [str, str, float, int, int, int, int, float, float, float],
     tuple[str, str, str, str],
 ]
+StudioValidatorFn = Callable[..., tuple[dict[str, object], ...]]
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _STUDIO_CSS = _PROJECT_ROOT / "assets" / "studio.css"
@@ -31,7 +32,7 @@ _FONT_HEAD = """
 _DEFAULT_RUNTIME_STATUS = {
     "device": "AUTO · accelerator selected per host",
     "cuda": "Primary",
-    "mps": "Portable",
+    "mps": "Planned",
     "zerogpu": "Compatible",
 }
 
@@ -90,6 +91,9 @@ def studio_launch_kwargs() -> dict[str, Any]:
 
 def build_ui(
     process_fn: StudioProcessFn,
+    *,
+    validator_fn: StudioValidatorFn,
+    hosted: bool,
     runtime_status: Mapping[str, str] | None = None,
 ) -> gr.Blocks:
     """Build the studio and bind its sole inference event to ``process_fn``."""
@@ -97,11 +101,11 @@ def build_ui(
         title="SAM3 Cutout Studio",
         analytics_enabled=False,
         fill_width=True,
-        delete_cache=(86_400, 86_400),
+        delete_cache=(600, 3600),
     ) as demo:
         gr.HTML(
             """
-            <header class="darkroom-masthead">
+            <header class="studio-masthead-grid">
               <div class="optical-mark" aria-hidden="true">
                 <span class="optical-iris"></span>
                 <span class="optical-cross optical-cross-x"></span>
@@ -117,7 +121,7 @@ def build_ui(
               </div>
               <div class="masthead-spec" aria-label="Output specification">
                 <span>TRACK</span><strong>MULTIPLEX</strong>
-                <span>REFINE</span><strong>ALPHA / 16-BIT</strong>
+                <span>REFINE</span><strong>SOFT ALPHA / 8-BIT</strong>
                 <span>MASTER</span><strong>RGBA + MATTE</strong>
               </div>
             </header>
@@ -148,6 +152,26 @@ def build_ui(
                     """,
                     container=False,
                 )
+                if hosted:
+                    with gr.Group(elem_id="hosted-access", elem_classes=["hosted-access"]):
+                        gr.HTML(
+                            """
+                            <div class="hosted-cue">
+                              <strong>Hosted ZeroGPU access</strong>
+                              <span>Sign in to reserve a 96 GB xlarge accelerator slice.</span>
+                              <span>Hosted jobs accept up to 3 prompt clauses.</span>
+                            </div>
+                            """,
+                            elem_id="hosted-cue",
+                            container=False,
+                        )
+                        gr.LoginButton(
+                            value="Sign in with Hugging Face",
+                            logout_value="Sign out ({})",
+                            variant="huggingface",
+                            elem_id="studio-login",
+                            elem_classes=["studio-login"],
+                        )
                 source_video = gr.Video(
                     label="Source footage",
                     sources=["upload"],
@@ -159,7 +183,11 @@ def build_ui(
                 subject_prompt = gr.Textbox(
                     label="Subject prompt",
                     placeholder="person, hair, collar mic",
-                    info="Name the foreground subject and edge details worth preserving.",
+                    info=(
+                        "Use up to 3 comma-separated subject clauses on hosted ZeroGPU."
+                        if hosted
+                        else "Use up to 4 comma-separated subject clauses on local CUDA."
+                    ),
                     lines=2,
                     max_lines=4,
                     elem_id="studio-prompt",
@@ -171,7 +199,11 @@ def build_ui(
                     elem_id="studio-run",
                 )
                 job_status = gr.Markdown(
-                    "**READY** · Load a clip and describe the foreground subject.",
+                    (
+                        "**READY** · Sign in, load a clip, and describe the foreground subject."
+                        if hosted
+                        else "**READY** · Load a clip and describe the foreground subject."
+                    ),
                     elem_id="job-status",
                     elem_classes=["job-status"],
                     container=False,
@@ -213,7 +245,7 @@ def build_ui(
                             8,
                             value=8,
                             step=1,
-                            label="Maximum objects",
+                            label="Maximum objects per prompt clause",
                             elem_id="max-objects",
                         )
                     detect_interval = gr.Slider(
@@ -330,7 +362,7 @@ def build_ui(
             """
             <footer class="studio-footer">
               <span>SAM3 CUTOUT STUDIO</span>
-              <span>PUBLIC SOURCE · GRADIO · CUDA / MPS / ZEROGPU</span>
+              <span>PUBLIC SOURCE · GRADIO · CUDA / ZEROGPU · MPS PLANNED</span>
               <span>FRAME ACCURACY OVER SPEED</span>
             </footer>
             """,
@@ -359,6 +391,11 @@ def build_ui(
             show_progress_on=[preview, job_status],
             concurrency_limit=1,
             concurrency_id="sam3-cutout-inference",
+            validator=validator_fn,
         )
 
-    return demo.queue(max_size=8, default_concurrency_limit=1)
+    return demo.queue(
+        api_open=False,
+        max_size=8,
+        default_concurrency_limit=1,
+    )

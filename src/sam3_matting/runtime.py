@@ -53,6 +53,7 @@ def target_device(
 def gpu(
     duration: GpuDuration = 60,
     *,
+    size: str | None = None,
     environ: Mapping[str, str] | None = None,
     spaces_module: Any | None = None,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
@@ -72,7 +73,10 @@ def gpu(
         gpu_factory = getattr(active_spaces, "GPU", None)
         if not callable(gpu_factory):
             raise RuntimeError("the spaces package does not expose a callable GPU decorator")
-        wrapped = gpu_factory(duration=duration)(function)
+        gpu_options: dict[str, object] = {"duration": duration}
+        if size is not None:
+            gpu_options["size"] = size
+        wrapped = gpu_factory(**gpu_options)(function)
         return cast(Callable[_P, _R], wrapped)
 
     return decorator

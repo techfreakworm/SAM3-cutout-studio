@@ -78,6 +78,7 @@ class VitMatteRefiner:
     """Lazy ViTMatte model wrapper bound to one explicit execution device."""
 
     MODEL_ID = "hustvl/vitmatte-small-composition-1k"
+    MODEL_REVISION = "6a58ad7646403c1df626fbd746900aec7361ea1d"
 
     def __init__(
         self,
@@ -89,6 +90,7 @@ class VitMatteRefiner:
         white_point: float = 0.99,
         max_megapixels: float = 2.0,
         model_id: str = MODEL_ID,
+        model_revision: str = MODEL_REVISION,
     ) -> None:
         self.device = device
         self.erode_kernel = erode_kernel
@@ -97,6 +99,7 @@ class VitMatteRefiner:
         self.white_point = white_point
         self.max_megapixels = max_megapixels
         self.model_id = model_id
+        self.model_revision = model_revision
         self.model: object | None = None
         self.processor: object | None = None
 
@@ -166,8 +169,14 @@ class VitMatteRefiner:
         import torch
         from transformers import VitMatteForImageMatting, VitMatteImageProcessor
 
-        self.processor = VitMatteImageProcessor.from_pretrained(self.model_id)
-        self.model = VitMatteForImageMatting.from_pretrained(self.model_id)
+        self.processor = VitMatteImageProcessor.from_pretrained(
+            self.model_id,
+            revision=self.model_revision,
+        )
+        self.model = VitMatteForImageMatting.from_pretrained(
+            self.model_id,
+            revision=self.model_revision,
+        )
         self.model.to(torch.device(self.device))
         self.model.eval()
 

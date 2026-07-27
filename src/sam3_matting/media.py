@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable, Iterator
-from contextlib import suppress
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from fractions import Fraction
+from numbers import Real
 from pathlib import Path
 from typing import ClassVar
 
 import av
 import numpy as np
+
+DEFAULT_FFPROBE_TIMEOUT_SECONDS = 30.0
+DEFAULT_FFMPEG_TIMEOUT_SECONDS = 120.0
+_AUDIO_CODECS_SAFE_FOR_MP4_AND_MOV = frozenset({"aac"})
 
 
 class MediaError(RuntimeError):
@@ -72,6 +77,78 @@ def _resolve_binary(name: str, explicit: str | os.PathLike[str] | None = None) -
     return resolved
 
 
+def _validate_timeout_seconds(value: object, *, tool: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{tool} timeout must be a positive finite number")
+    timeout_seconds = float(value)
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError(f"{tool} timeout must be a positive finite number")
+    return timeout_seconds
+
+
+def _run_cleanups(
+    cleanups: Iterable[Callable[[], object]],
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Attempt every cleanup without replacing an initiating failure."""
+
+    first_failure = primary
+    for cleanup in cleanups:
+        try:
+            cleanup()
+        except BaseException as exc:
+            if first_failure is None:
+                first_failure = exc
+    if primary is None and first_failure is not None:
+        raise first_failure
+
+
+class _ExclusivePublisher:
+    """Publish a complete temporary file without replacing an existing path."""
+
+    def __init__(self, source: Path, destination: Path) -> None:
+        self.source = source
+        self.destination = destination
+        self._destination_preexisted = destination.exists()
+        self.owns_destination = False
+
+    def _recover_ambiguous_link_ownership(self) -> None:
+        if self._destination_preexisted:
+            return
+        try:
+            self.owns_destination = self.source.samefile(self.destination)
+        except OSError:
+            self.owns_destination = False
+
+    def _remove_owned_destination(self) -> None:
+        if not self.owns_destination:
+            return
+        self.destination.unlink(missing_ok=True)
+        self.owns_destination = False
+
+    def rollback(self, *, primary: BaseException | None = None) -> None:
+        """Remove only a destination proven to have been linked by this publisher."""
+
+        _run_cleanups((self._remove_owned_destination,), primary=primary)
+
+    def publish(self) -> None:
+        try:
+            try:
+                os.link(self.source, self.destination)
+            except FileExistsError as exc:
+                raise MediaEncodeError(
+                    f"Could not publish {self.destination.name}: destination already exists"
+                ) from exc
+            self.owns_destination = True
+            self.source.unlink()
+        except BaseException as exc:
+            if not self.owns_destination:
+                self._recover_ambiguous_link_ownership()
+            self.rollback(primary=exc)
+            raise
+
+
 def _parse_fraction(value: object) -> Fraction:
     if not isinstance(value, str) or value in {"", "0/0", "N/A"}:
         return Fraction(0, 1)
@@ -89,12 +166,17 @@ def probe_video(
     path: str | os.PathLike[str],
     *,
     ffprobe_binary: str | os.PathLike[str] | None = None,
+    ffprobe_timeout_seconds: float = DEFAULT_FFPROBE_TIMEOUT_SECONDS,
 ) -> VideoMetadata:
     """Read stable video metadata with ffprobe."""
 
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(source)
+    timeout_seconds = _validate_timeout_seconds(
+        ffprobe_timeout_seconds,
+        tool="ffprobe",
+    )
 
     command = [
         _resolve_binary("ffprobe", ffprobe_binary),
@@ -112,8 +194,18 @@ def probe_video(
         str(source),
     ]
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
         payload = json.loads(completed.stdout)
+    except subprocess.TimeoutExpired as exc:
+        raise MediaProbeError(
+            f"Could not inspect {source.name}: ffprobe timed out after {timeout_seconds:g} seconds"
+        ) from exc
     except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
         raise MediaProbeError(f"Could not inspect {source.name}: {detail.strip()}") from exc
@@ -154,13 +246,26 @@ def validate_input(
     limits: InputLimits,
     *,
     ffprobe_binary: str | os.PathLike[str] | None = None,
+    ffprobe_timeout_seconds: float = DEFAULT_FFPROBE_TIMEOUT_SECONDS,
 ) -> VideoMetadata:
     """Probe an upload and reject it before expensive inference if it exceeds limits."""
 
     source = Path(path)
-    metadata = probe_video(source, ffprobe_binary=ffprobe_binary)
-    violations: list[str] = []
+    if not source.is_file():
+        raise FileNotFoundError(source)
 
+    file_size_bytes = source.stat().st_size
+    if limits.max_file_size_bytes is not None and file_size_bytes > limits.max_file_size_bytes:
+        raise MediaValidationError(
+            (f"file size {file_size_bytes} bytes exceeds {limits.max_file_size_bytes} bytes",)
+        )
+
+    metadata = probe_video(
+        source,
+        ffprobe_binary=ffprobe_binary,
+        ffprobe_timeout_seconds=ffprobe_timeout_seconds,
+    )
+    violations: list[str] = []
     if limits.max_duration_seconds is not None and metadata.duration_seconds > limits.max_duration_seconds:
         violations.append(
             f"duration {metadata.duration_seconds:.3f}s exceeds {limits.max_duration_seconds:.3f}s"
@@ -173,10 +278,6 @@ def validate_input(
         violations.append(f"frame count {metadata.frame_count} exceeds {limits.max_frames}")
     if limits.max_fps is not None and metadata.fps > limits.max_fps:
         violations.append(f"frame rate {float(metadata.fps):.3f}fps exceeds {float(limits.max_fps):.3f}fps")
-
-    file_size_bytes = source.stat().st_size
-    if limits.max_file_size_bytes is not None and file_size_bytes > limits.max_file_size_bytes:
-        violations.append(f"file size {file_size_bytes} bytes exceeds {limits.max_file_size_bytes} bytes")
 
     if violations:
         raise MediaValidationError(tuple(violations))
@@ -198,15 +299,80 @@ def decode_video_frames(path: str | os.PathLike[str]) -> Iterator[np.ndarray]:
             yield np.ascontiguousarray(frame.to_ndarray(format="rgb24"))
 
 
+def _probe_source_audio_codec(
+    source_audio: Path,
+    ffprobe_binary: str | os.PathLike[str] | None,
+    timeout_seconds: float,
+) -> str | None:
+    try:
+        resolved_ffprobe = _resolve_binary("ffprobe", ffprobe_binary)
+    except MediaProbeError as exc:
+        raise MediaEncodeError(str(exc)) from exc
+
+    command = [
+        resolved_ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "json",
+        str(source_audio),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        payload = json.loads(completed.stdout)
+    except subprocess.TimeoutExpired as exc:
+        raise MediaEncodeError(
+            f"Could not inspect source audio: ffprobe timed out after {timeout_seconds:g} seconds"
+        ) from exc
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        raise MediaEncodeError(
+            f"Could not inspect source audio in {source_audio.name}: {detail.strip()}"
+        ) from exc
+
+    streams = payload.get("streams", [])
+    codec_name = streams[0].get("codec_name") if streams else None
+    return codec_name if isinstance(codec_name, str) and codec_name else None
+
+
 def _remux_source_audio(
     video_only: Path,
     source_audio: Path,
     output: Path,
     ffmpeg_binary: str | os.PathLike[str] | None,
+    *,
+    ffprobe_binary: str | os.PathLike[str] | None = None,
+    ffprobe_timeout_seconds: float = DEFAULT_FFPROBE_TIMEOUT_SECONDS,
+    ffmpeg_timeout_seconds: float = DEFAULT_FFMPEG_TIMEOUT_SECONDS,
+    publications: list[_ExclusivePublisher] | None = None,
 ) -> None:
     if not source_audio.is_file():
         raise FileNotFoundError(source_audio)
+    probe_timeout_seconds = _validate_timeout_seconds(
+        ffprobe_timeout_seconds,
+        tool="ffprobe",
+    )
+    remux_timeout_seconds = _validate_timeout_seconds(
+        ffmpeg_timeout_seconds,
+        tool="ffmpeg",
+    )
     resolved_ffmpeg = _resolve_binary("ffmpeg", ffmpeg_binary)
+    source_audio_codec = _probe_source_audio_codec(
+        source_audio,
+        ffprobe_binary,
+        probe_timeout_seconds,
+    )
+    audio_mode = "copy" if source_audio_codec in _AUDIO_CODECS_SAFE_FOR_MP4_AND_MOV else "aac"
 
     with tempfile.NamedTemporaryFile(
         prefix=f".{output.stem}-audio-", suffix=output.suffix or ".mp4", dir=output.parent, delete=False
@@ -228,18 +394,38 @@ def _remux_source_audio(
         "-c:v",
         "copy",
         "-c:a",
-        "copy",
-        "-shortest",
+        audio_mode,
         "-movflags",
         "+faststart",
         str(remuxed),
     ]
+    active_publication: _ExclusivePublisher | None = None
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-        remuxed.replace(output)
-    except subprocess.CalledProcessError as exc:
-        remuxed.unlink(missing_ok=True)
-        raise MediaEncodeError(f"Could not preserve source audio: {exc.stderr.strip()}") from exc
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=remux_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise MediaEncodeError(
+                f"Could not preserve source audio: ffmpeg timed out after {remux_timeout_seconds:g} seconds"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise MediaEncodeError(f"Could not preserve source audio: {exc.stderr.strip()}") from exc
+        active_publication = _ExclusivePublisher(remuxed, output)
+        if publications is not None:
+            publications.append(active_publication)
+        active_publication.publish()
+    except BaseException as exc:
+        cleanups: list[Callable[[], object]] = []
+        if active_publication is not None:
+            cleanups.append(active_publication.rollback)
+        cleanups.append(lambda: remuxed.unlink(missing_ok=True))
+        _run_cleanups(cleanups, primary=exc)
+        raise
 
 
 class _IncrementalVideoSink:
@@ -258,6 +444,9 @@ class _IncrementalVideoSink:
         fps: Fraction | int | float,
         source_audio_path: str | os.PathLike[str] | None = None,
         ffmpeg_binary: str | os.PathLike[str] | None = None,
+        ffprobe_binary: str | os.PathLike[str] | None = None,
+        ffprobe_timeout_seconds: float = DEFAULT_FFPROBE_TIMEOUT_SECONDS,
+        ffmpeg_timeout_seconds: float = DEFAULT_FFMPEG_TIMEOUT_SECONDS,
     ) -> None:
         frame_rate = Fraction(fps).limit_denominator(100_000)
         if frame_rate <= 0:
@@ -268,6 +457,15 @@ class _IncrementalVideoSink:
         self.fps = frame_rate
         self.source_audio_path = Path(source_audio_path) if source_audio_path is not None else None
         self.ffmpeg_binary = ffmpeg_binary
+        self.ffprobe_binary = ffprobe_binary
+        self.ffprobe_timeout_seconds = _validate_timeout_seconds(
+            ffprobe_timeout_seconds,
+            tool="ffprobe",
+        )
+        self.ffmpeg_timeout_seconds = _validate_timeout_seconds(
+            ffmpeg_timeout_seconds,
+            tool="ffmpeg",
+        )
         self._container = None
         self._stream = None
         self._temporary: Path | None = None
@@ -275,6 +473,7 @@ class _IncrementalVideoSink:
         self._frame_count = 0
         self._closed = False
         self._succeeded = False
+        self._publications: list[_ExclusivePublisher] = []
 
     @property
     def frame_count(self) -> int:
@@ -331,8 +530,10 @@ class _IncrementalVideoSink:
             for packet in self._stream.encode(video_frame):
                 self._container.mux(packet)
             self._frame_count += 1
-        except Exception as exc:
-            self.abort()
+        except BaseException as exc:
+            self.abort(primary=exc)
+            if not isinstance(exc, Exception):
+                raise
             if isinstance(exc, MediaEncodeError):
                 raise
             raise MediaEncodeError(f"Could not encode frame {self._frame_count}: {exc}") from exc
@@ -345,8 +546,9 @@ class _IncrementalVideoSink:
                 return self.output_path
             raise MediaEncodeError("video sink is closed after a failed encode")
         if self._frame_count == 0 or self._container is None or self._stream is None:
-            self.abort()
-            raise MediaEncodeError("at least one frame is required")
+            error = MediaEncodeError("at least one frame is required")
+            self.abort(primary=error)
+            raise error
 
         try:
             for packet in self._stream.encode():
@@ -356,38 +558,56 @@ class _IncrementalVideoSink:
 
             assert self._temporary is not None
             if self.source_audio_path is None:
-                self._temporary.replace(self.output_path)
+                publication = _ExclusivePublisher(self._temporary, self.output_path)
+                self._publications.append(publication)
+                publication.publish()
             else:
                 _remux_source_audio(
                     self._temporary,
                     self.source_audio_path,
                     self.output_path,
                     self.ffmpeg_binary,
+                    ffprobe_binary=self.ffprobe_binary,
+                    ffprobe_timeout_seconds=self.ffprobe_timeout_seconds,
+                    ffmpeg_timeout_seconds=self.ffmpeg_timeout_seconds,
+                    publications=self._publications,
                 )
                 self._temporary.unlink(missing_ok=True)
             self._temporary = None
             self._closed = True
             self._succeeded = True
             return self.output_path
-        except Exception as exc:
-            self.abort()
+        except BaseException as exc:
+            self.abort(primary=exc, discard_output=True)
+            if not isinstance(exc, Exception):
+                raise
             if isinstance(exc, (MediaEncodeError, FileNotFoundError)):
                 raise
             raise MediaEncodeError(f"Could not finalize {self.output_path.name}: {exc}") from exc
 
-    def abort(self) -> None:
-        """Discard any partial output and leave the destination untouched."""
+    def abort(
+        self,
+        *,
+        primary: BaseException | None = None,
+        discard_output: bool = False,
+    ) -> None:
+        """Discard partial artifacts while preserving any pre-existing destination."""
 
         container = self._container
+        temporary = self._temporary
         self._container = None
         self._stream = None
-        if container is not None:
-            with suppress(Exception):
-                container.close()
-        if self._temporary is not None:
-            self._temporary.unlink(missing_ok=True)
-            self._temporary = None
+        self._temporary = None
         self._closed = True
+
+        cleanups: list[Callable[[], object]] = []
+        if container is not None:
+            cleanups.append(container.close)
+        if temporary is not None:
+            cleanups.append(lambda: temporary.unlink(missing_ok=True))
+        if discard_output:
+            cleanups.extend(publication.rollback for publication in self._publications)
+        _run_cleanups(cleanups, primary=primary)
 
     def __enter__(self):
         return self
@@ -396,7 +616,7 @@ class _IncrementalVideoSink:
         if exc_type is None:
             self.close()
         else:
-            self.abort()
+            self.abort(primary=exc)
         return False
 
 
@@ -427,6 +647,9 @@ def encode_video_frames(
     fps: Fraction | int | float,
     source_audio_path: str | os.PathLike[str] | None = None,
     ffmpeg_binary: str | os.PathLike[str] | None = None,
+    ffprobe_binary: str | os.PathLike[str] | None = None,
+    ffprobe_timeout_seconds: float = DEFAULT_FFPROBE_TIMEOUT_SECONDS,
+    ffmpeg_timeout_seconds: float = DEFAULT_FFMPEG_TIMEOUT_SECONDS,
 ) -> Path:
     """Encode RGB frames to a deterministic-timing H.264 MP4."""
 
@@ -435,6 +658,9 @@ def encode_video_frames(
         fps=fps,
         source_audio_path=source_audio_path,
         ffmpeg_binary=ffmpeg_binary,
+        ffprobe_binary=ffprobe_binary,
+        ffprobe_timeout_seconds=ffprobe_timeout_seconds,
+        ffmpeg_timeout_seconds=ffmpeg_timeout_seconds,
     )
     with sink:
         for frame in frames:
