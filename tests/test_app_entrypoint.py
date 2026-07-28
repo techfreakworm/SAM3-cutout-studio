@@ -176,15 +176,19 @@ def test_local_launch_allows_two_gibibyte_uploads_without_exposing_tracebacks() 
     }
 
 
-def test_space_requirements_install_the_src_layout_package() -> None:
-    requirements = Path(__file__).resolve().parents[1] / "requirements.txt"
-    entries = {
+def test_space_requirements_install_runtime_dependencies_without_project_source() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    requirements = {
         line.split("#", maxsplit=1)[0].strip()
-        for line in requirements.read_text().splitlines()
+        for line in (project_root / "requirements.txt").read_text().splitlines()
         if line.split("#", maxsplit=1)[0].strip()
     }
+    pyproject = tomllib.loads((project_root / "pyproject.toml").read_text())
 
-    assert entries == {"-e ."}
+    # Hugging Face Spaces install requirements.txt before copying application
+    # source, so editable or local-path entries cannot resolve there.
+    assert requirements == set(pyproject["project"]["dependencies"])
+    assert all(not entry.startswith("-") for entry in requirements)
 
 
 def test_pyproject_pins_runtime_and_contributor_dependencies() -> None:

@@ -8,18 +8,27 @@ import os
 if os.environ.get("SPACES_ZERO_GPU") or os.environ.get("SPACES_ZERO_GPU_V2"):
     importlib.import_module("spaces")
 
-from collections.abc import Callable, Mapping
+import sys
 from pathlib import Path
-from typing import Any
 
-from sam3_matting.application import (
+# Hugging Face Spaces install requirements.txt before copying the application
+# source, so the src-layout package cannot be pip-installed there. When running
+# from a source checkout, make the package importable directly.
+_SOURCE_PACKAGE = Path(__file__).resolve().parent / "src"
+if (_SOURCE_PACKAGE / "sam3_matting").is_dir() and str(_SOURCE_PACKAGE) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_PACKAGE))
+
+from collections.abc import Callable, Mapping  # noqa: E402
+from typing import Any  # noqa: E402
+
+from sam3_matting.application import (  # noqa: E402
     ApplicationResources,
     build_resources,
     create_process_callback,
     create_request_validator,
 )
-from sam3_matting.runtime import gpu, on_zerogpu, resolve_sam_checkpoint, target_device
-from sam3_matting.ui import build_ui, studio_launch_kwargs
+from sam3_matting.runtime import gpu, on_zerogpu, resolve_sam_checkpoint, target_device  # noqa: E402
+from sam3_matting.ui import build_ui, studio_launch_kwargs  # noqa: E402
 
 RESOURCES: ApplicationResources | None = None
 DEMO: Any | None = None
