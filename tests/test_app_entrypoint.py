@@ -53,6 +53,9 @@ def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chr
         events.append(("gpu", (duration, size)))
 
         def decorate(callback: object) -> object:
+            if getattr(callback, "__name__", "") == "preload_resources":
+                events.append(("decorate", "preload_resources"))
+                return lambda: callback()
             events.append(("decorate", callback))
             return decorated_callback
 
@@ -85,6 +88,8 @@ def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chr
         ("checkpoint", None),
         ("device", None),
         ("zerogpu", None),
+        ("gpu", (240, "xlarge")),
+        ("decorate", "preload_resources"),
         (
             "resources",
             (
@@ -107,6 +112,65 @@ def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chr
                     "cuda": "Active",
                     "mps": "Next phase",
                     "zerogpu": "96 GB xlarge",
+                },
+            ),
+        ),
+    ]
+
+
+def test_bootstrap_local_cuda_preloads_without_gpu_lease() -> None:
+    app = importlib.import_module("app")
+    events: list[tuple[str, object]] = []
+    resources = object()
+    raw_callback = object()
+    validator = object()
+    demo = object()
+
+    def gpu_factory(*, duration: int, size: str):
+        events.append(("gpu", (duration, size)))
+
+        def decorate(callback: object) -> object:
+            events.append(("decorate", callback))
+            return callback  # runtime.gpu is a no-op outside ZeroGPU
+
+        return decorate
+
+    built_resources, built_demo = app.bootstrap_application(
+        resolve_checkpoint_fn=lambda: Path("/models/sam.safetensors"),
+        target_device_fn=lambda: "cuda",
+        zerogpu_detector=lambda: False,
+        build_resources_fn=lambda checkpoint, **kwargs: events.append(("resources", (checkpoint, kwargs)))
+        or resources,
+        create_callback_fn=lambda active_resources, **kwargs: events.append(
+            ("callback", (active_resources, kwargs))
+        )
+        or raw_callback,
+        create_validator_fn=lambda **kwargs: events.append(("validator", kwargs)) or validator,
+        gpu_factory=gpu_factory,
+        build_ui_fn=lambda callback, **kwargs: events.append(("ui", (callback, kwargs))) or demo,
+    )
+
+    assert built_resources is resources
+    assert built_demo is demo
+    assert events == [
+        ("resources", (Path("/models/sam.safetensors"), {"device": "cuda", "preload": True})),
+        ("callback", (resources, {"zerogpu": False})),
+        ("validator", {"zerogpu": False}),
+        ("gpu", (90, "xlarge")),
+        ("decorate", raw_callback),
+        (
+            "ui",
+            (
+                raw_callback,
+                {
+                    "validator_fn": validator,
+                    "hosted": False,
+                    "runtime_status": {
+                        "device": "CUDA",
+                        "cuda": "Active",
+                        "mps": "Next phase",
+                        "zerogpu": "Available",
+                    },
                 },
             ),
         ),
@@ -288,8 +352,9 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
             record("runtime-import")
 
             def gpu(*, duration, size):
-                assert duration == 90
+                assert duration in (90, 240)
                 assert size == "xlarge"
+                record(f"gpu-lease-{duration}")
                 return lambda function: function
 
             def on_zerogpu():
@@ -363,3 +428,5 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
         assert events.index("spaces-import") < events.index(later_event)
     assert events.count("model-preload") == 1
     assert events.index("model-preload") < events.index("launch")
+    assert events.index("gpu-lease-240") < events.index("model-preload")
+    assert events.index("model-preload") < events.index("gpu-lease-90")
