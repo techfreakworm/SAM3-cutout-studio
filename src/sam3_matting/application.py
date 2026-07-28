@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import tempfile
+import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -516,6 +518,17 @@ def create_process_callback(
             message = f"Could not process this video. Reference: {incident_id}"
             if os.environ.get("SAM3_DEBUG_ERRORS"):
                 message += f" (debug: {type(exc).__name__}: {str(exc)[:180]})"
+                detail = {
+                    "incident": incident_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                    "traceback": traceback.format_exc()[-2000:],
+                }
+                try:
+                    with (cache_root / "incidents.jsonl").open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(detail) + "\n")
+                except OSError:
+                    _LOGGER.warning("could not write incident detail", exc_info=True)
             raise error_factory(message) from exc
 
     return process
