@@ -101,7 +101,7 @@ def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chr
         ("zerogpu", None),
         ("callback", (True, {"zerogpu": True})),
         ("validator", {"zerogpu": True}),
-        ("gpu", (120, "xlarge")),
+        ("gpu", (60, "xlarge")),
         ("decorate", raw_callback),
         (
             "ui",
@@ -158,7 +158,7 @@ def test_bootstrap_local_cuda_preloads_without_gpu_lease() -> None:
         ("resources", (Path("/models/sam.safetensors"), {"device": "cuda", "preload": True})),
         ("callback", (resources, {"zerogpu": False})),
         ("validator", {"zerogpu": False}),
-        ("gpu", (120, "xlarge")),
+        ("gpu", (60, "xlarge")),
         ("decorate", raw_callback),
         (
             "ui",
@@ -355,7 +355,7 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
             record("runtime-import")
 
             def gpu(*, duration, size):
-                assert duration == 120
+                assert duration == 60
                 assert size == "xlarge"
                 record(f"gpu-lease-{duration}")
                 return lambda function: function
@@ -442,6 +442,6 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
     # ZeroGPU builds lazily inside the GPU worker on the first request, so no
     # model preload may happen at startup in the main process.
     assert "model-preload" not in events
-    assert events.count("gpu-lease-120") == 1
-    assert events.index("gpu-lease-120") < events.index("ui-build")
+    assert events.count("gpu-lease-60") == 1
+    assert events.index("gpu-lease-60") < events.index("ui-build")
     assert "gpu-lease-90" not in events

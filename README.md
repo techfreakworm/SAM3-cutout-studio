@@ -40,7 +40,7 @@ ViTMatte produces a soft floating-point alpha. The preview is composited from th
 
 ## Hosted ZeroGPU contract
 
-The hosted app requires Hugging Face sign-in. It uses an xlarge ZeroGPU allocation (the full 96 GB RTX PRO 6000 Blackwell slice) with a 120-second GPU duration request. One inference runs at a time, at most eight jobs may wait, and public Gradio API exposure is disabled with `api_open=False`; the supported hosted entry point is the browser UI.
+The hosted app requires Hugging Face sign-in. It uses an xlarge ZeroGPU allocation (the full 96 GB RTX PRO 6000 Blackwell slice) with a 60-second GPU duration request. One inference runs at a time, at most eight jobs may wait, and public Gradio API exposure is disabled with `api_open=False`; the supported hosted entry point is the browser UI.
 
 Hosted input is rejected before model inference unless it satisfies all of these limits:
 
