@@ -2,6 +2,7 @@ import inspect
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
+from pathlib import Path
 from threading import Barrier, BrokenBarrierError, Lock, get_ident, local
 from types import SimpleNamespace
 
@@ -1123,8 +1124,9 @@ def test_sam31_missing_key_classification_allows_generated_buffers_and_unused_pr
     assert blocking == ("detector.transformer.encoder.layers.0.linear1.weight",)
 
 
-def test_public_safetensors_builder_loads_meta_model_and_initializes_allowed_projection() -> None:
-    import os
+def test_public_safetensors_builder_loads_meta_model_and_initializes_allowed_projection(
+    tmp_path: Path,
+) -> None:
     from types import SimpleNamespace
 
     import torch
@@ -1145,13 +1147,11 @@ def test_public_safetensors_builder_loads_meta_model_and_initializes_allowed_pro
     predictor = SimpleNamespace(model=model)
     builder_calls: list[dict[str, object]] = []
     load_calls: list[tuple[object, str, bool, str]] = []
-    temporary_checkpoint: list[str] = []
 
     def builder(**kwargs: object) -> object:
         builder_calls.append(kwargs)
-        temporary_checkpoint.append(str(kwargs["checkpoint_path"]))
-        assert os.path.exists(temporary_checkpoint[-1])
-        assert temporary_checkpoint[-1].endswith(".pt")
+        # torch.load is stubbed during construction so no checkpoint bytes are read.
+        assert torch.load("ignored") == {}
         return predictor
 
     def load_model(
@@ -1180,12 +1180,11 @@ def test_public_safetensors_builder_loads_meta_model_and_initializes_allowed_pro
     assert result is predictor
     assert builder_calls == [
         {
-            "checkpoint_path": temporary_checkpoint[0],
+            "checkpoint_path": "/models/sam3.1_multiplex_fp16.safetensors",
             "max_num_objects": 8,
             "compile": False,
         }
     ]
-    assert os.path.exists(temporary_checkpoint[0]) is False
     assert load_calls == [
         (
             model,
@@ -1195,6 +1194,10 @@ def test_public_safetensors_builder_loads_meta_model_and_initializes_allowed_pro
         )
     ]
     torch.testing.assert_close(projection, torch.zeros_like(projection))
+
+    restored_probe = tmp_path / "restored.pt"
+    torch.save({"ok": 1}, restored_probe)
+    assert torch.load(restored_probe, weights_only=True) == {"ok": 1}
 
 
 def test_public_safetensors_builder_rejects_missing_learned_weights() -> None:

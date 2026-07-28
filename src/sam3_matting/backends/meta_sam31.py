@@ -4,7 +4,6 @@ import contextlib
 import inspect
 import io
 import logging
-import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -39,17 +38,23 @@ def _build_safetensors_predictor(
     load_model: Callable[..., tuple[list[str], list[str]]],
     builder_kwargs: dict[str, object],
 ) -> object:
-    """Build Meta's architecture with an empty PT then load safetensors directly."""
+    """Build Meta's architecture with a stubbed torch.load, then load safetensors."""
+    from unittest import mock
+
     import torch
 
-    with tempfile.NamedTemporaryFile(suffix=".pt") as empty_checkpoint:
-        torch.save({}, empty_checkpoint.name)
-        quiet_builder_output = io.StringIO()
-        with contextlib.redirect_stdout(quiet_builder_output):
-            predictor = predictor_builder(
-                checkpoint_path=empty_checkpoint.name,
-                **builder_kwargs,
-            )
+    # Meta's builder only consumes .pt checkpoints through torch.load, but the
+    # real weights arrive through safetensors below, so construction runs against
+    # an empty state dict. A torch.save/torch.load roundtrip is unreliable under
+    # ZeroGPU's torch patching, so torch.load is stubbed for the construction
+    # call instead of writing an empty checkpoint to disk. The string path is
+    # still forwarded so builder diagnostics stay truthful.
+    quiet_builder_output = io.StringIO()
+    with contextlib.redirect_stdout(quiet_builder_output), mock.patch.object(torch, "load", return_value={}):
+        predictor = predictor_builder(
+            checkpoint_path=checkpoint_path,
+            **builder_kwargs,
+        )
 
     try:
         missing_keys, unexpected_keys = load_model(
