@@ -8,6 +8,8 @@ import textwrap
 import tomllib
 from pathlib import Path
 
+import pytest
+
 
 def test_importing_entrypoint_has_no_model_or_ui_side_effects() -> None:
     app = importlib.import_module("app")
@@ -16,7 +18,11 @@ def test_importing_entrypoint_has_no_model_or_ui_side_effects() -> None:
     assert app.DEMO is None
 
 
-def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chrome() -> None:
+def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chrome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sam3_matting.zerogpu_worker as worker
+
     app = importlib.import_module("app")
     events: list[tuple[str, object]] = []
     resources = object()
@@ -37,12 +43,19 @@ def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chr
         events.append(("zerogpu", None))
         return True
 
+    worker_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        worker,
+        "get_or_build_resources",
+        lambda checkpoint, device: worker_calls.append((checkpoint, device)) or resources,
+    )
+
     def make_resources(checkpoint: Path, **kwargs: object) -> object:
         events.append(("resources", (checkpoint, kwargs)))
         return resources
 
     def make_callback(active_resources: object, **kwargs: object) -> object:
-        events.append(("callback", (active_resources, kwargs)))
+        events.append(("callback", (callable(active_resources), kwargs)))
         return raw_callback
 
     def make_validator(**kwargs: object) -> object:
@@ -53,9 +66,6 @@ def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chr
         events.append(("gpu", (duration, size)))
 
         def decorate(callback: object) -> object:
-            if getattr(callback, "__name__", "") == "preload_resources":
-                events.append(("decorate", "preload_resources"))
-                return lambda: callback()
             events.append(("decorate", callback))
             return decorated_callback
 
@@ -82,24 +92,16 @@ def test_bootstrap_preloads_then_decorates_exact_callback_and_builds_runtime_chr
         build_ui_fn=make_ui,
     )
 
-    assert built_resources is resources
+    assert built_resources() is resources
+    assert worker_calls == [("/models/sam.safetensors", "cuda")]
     assert built_demo is demo
     assert events == [
         ("checkpoint", None),
         ("device", None),
         ("zerogpu", None),
-        ("gpu", (240, "xlarge")),
-        ("decorate", "preload_resources"),
-        (
-            "resources",
-            (
-                Path("/models/sam.safetensors"),
-                {"device": "cuda", "preload": True},
-            ),
-        ),
-        ("callback", (resources, {"zerogpu": True})),
+        ("callback", (True, {"zerogpu": True})),
         ("validator", {"zerogpu": True}),
-        ("gpu", (90, "xlarge")),
+        ("gpu", (240, "xlarge")),
         ("decorate", raw_callback),
         (
             "ui",
@@ -156,7 +158,7 @@ def test_bootstrap_local_cuda_preloads_without_gpu_lease() -> None:
         ("resources", (Path("/models/sam.safetensors"), {"device": "cuda", "preload": True})),
         ("callback", (resources, {"zerogpu": False})),
         ("validator", {"zerogpu": False}),
-        ("gpu", (90, "xlarge")),
+        ("gpu", (240, "xlarge")),
         ("decorate", raw_callback),
         (
             "ui",
@@ -330,6 +332,7 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
                 return object()
 
             def create_process_callback(_resources, *, zerogpu):
+                assert callable(_resources)
                 assert zerogpu is True
                 return lambda *_args: None
 
@@ -352,7 +355,7 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
             record("runtime-import")
 
             def gpu(*, duration, size):
-                assert duration in (90, 240)
+                assert duration == 240
                 assert size == "xlarge"
                 record(f"gpu-lease-{duration}")
                 return lambda function: function
@@ -398,6 +401,17 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
         )
     )
 
+    (fake_package / "zerogpu_worker.py").write_text(
+        textwrap.dedent(
+            """
+            def get_or_build_resources(checkpoint, device):
+                from sam3_matting.application import build_resources
+
+                return build_resources(checkpoint, device=device, preload=True)
+            """
+        )
+    )
+
     environment = os.environ.copy()
     environment.update(
         {
@@ -423,10 +437,11 @@ def test_zerogpu_entrypoint_imports_spaces_before_project_or_accelerator_startup
         "runtime-import",
         "ui-import",
         "torch-cuda-init",
-        "model-preload",
     ):
         assert events.index("spaces-import") < events.index(later_event)
-    assert events.count("model-preload") == 1
-    assert events.index("model-preload") < events.index("launch")
-    assert events.index("gpu-lease-240") < events.index("model-preload")
-    assert events.index("model-preload") < events.index("gpu-lease-90")
+    # ZeroGPU builds lazily inside the GPU worker on the first request, so no
+    # model preload may happen at startup in the main process.
+    assert "model-preload" not in events
+    assert events.count("gpu-lease-240") == 1
+    assert events.index("gpu-lease-240") < events.index("ui-build")
+    assert "gpu-lease-90" not in events

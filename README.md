@@ -96,7 +96,7 @@ python -m ruff check .
 | SAM checkpoint SHA-256 | `9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03` |
 | ViTMatte | `hustvl/vitmatte-small-composition-1k@6a58ad7646403c1df626fbd746900aec7361ea1d` |
 
-Space startup preloads the exact SAM checkpoint and ViTMatte `config.json`, `model.safetensors`, and `preprocessor_config.json` into the Hub disk cache. That file staging does not instantiate a model. Application startup then constructs and eagerly materializes one process-wide SAM backend and one ViTMatte refiner, retaining both in module-level resources for queued requests. `startup_duration_timeout: 1h` gives a cold Space enough time to download and initialize these large eager models.
+Space startup preloads the exact SAM checkpoint and ViTMatte `config.json`, `model.safetensors`, and `preprocessor_config.json` into the Hub disk cache. That file staging does not instantiate a model. On ZeroGPU, model construction happens lazily inside the persistent GPU worker on the first request, because built models cannot cross the worker's pickle boundary; the first request therefore includes one-time model construction, and later requests reuse the resident models. Local CUDA startup instead eagerly materializes one process-wide SAM backend and one ViTMatte refiner for queued requests. `startup_duration_timeout: 1h` gives a cold Space enough time to warm up dependencies and caches.
 
 ## Output retention and privacy
 

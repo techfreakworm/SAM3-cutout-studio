@@ -42,9 +42,11 @@ The Space frontmatter pins and preloads these files into the Hugging Face Hub di
 - `Comfy-Org/sam3.1` file `checkpoints/sam3.1_multiplex_fp16.safetensors` at revision `ba901fbc9701054c359ed5240c4d76f83a178108`;
 - `hustvl/vitmatte-small-composition-1k` files `config.json`, `model.safetensors`, and `preprocessor_config.json` at revision `6a58ad7646403c1df626fbd746900aec7361ea1d`.
 
-Hub preload is file staging only. `bootstrap_application()` creates `ApplicationResources` with eager preload enabled, materializes one SAM predictor and one ViTMatte model, and retains both in module-level `RESOURCES`. Requests reuse these process-wide instances. Per-request ViTMatte settings are applied under the shared resource lock and restored afterward.
+Hub preload is file staging only. Local CUDA startup creates `ApplicationResources` with eager preload enabled, materializes one SAM predictor and one ViTMatte model, and retains both in module-level `RESOURCES`; requests reuse these process-wide instances. Per-request ViTMatte settings are applied under the shared resource lock and restored afterward.
 
-A one-hour Space `startup_duration_timeout` accommodates cold artifact download and eager model construction. It is a startup ceiling, not an expected boot time.
+ZeroGPU differs deliberately. GPU tasks execute in a persistent worker process and only pickled values cross its boundary, so built models cannot leave it. The first request constructs both models inside that worker through `sam3_matting.zerogpu_worker`, and later requests reuse the resident instances. Startup performs no eager preload on ZeroGPU, and the request lease duration is sized to cover one-time construction plus one inference.
+
+A one-hour Space `startup_duration_timeout` accommodates cold dependency and cache warmup. It is a startup ceiling, not an expected boot time.
 
 ## Hosted and local policy
 

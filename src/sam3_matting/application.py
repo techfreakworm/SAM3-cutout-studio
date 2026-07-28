@@ -421,7 +421,7 @@ def _cleanup_failed_request(request_directory: Path | None) -> None:
 
 
 def create_process_callback(
-    resources: ApplicationResources,
+    resources: ApplicationResources | Callable[[], ApplicationResources],
     *,
     zerogpu: bool,
     pipeline_fn: PipelineFn = run_pipeline,
@@ -434,7 +434,12 @@ def create_process_callback(
     [str, str, float, int, int, int, int, float, float, float],
     tuple[str, str, str, str],
 ]:
-    """Create the exact ten-input/four-output Gradio inference callback."""
+    """Create the exact ten-input/four-output Gradio inference callback.
+
+    ``resources`` may be the eagerly built resources (local CUDA) or a provider
+    invoked on each call (ZeroGPU), so models can be resolved lazily inside the
+    persistent GPU worker instead of crossing its pickle boundary.
+    """
     limits = select_input_limits(zerogpu)
     cache_root = _output_root(output_root)
 
@@ -480,14 +485,15 @@ def create_process_callback(
             progress = progress_factory()
             progress_callback = _progress_bridge(progress)
 
-            with resources.configured_refiner(matte) as refiner:
+            active_resources = resources() if callable(resources) else resources
+            with active_resources.configured_refiner(matte) as refiner:
                 result = pipeline_fn(
                     source,
                     prompt=prompt,
                     detection_threshold=tracking.detection_threshold,
                     detect_interval=tracking.detect_interval,
                     max_objects=tracking.max_objects,
-                    backend=resources.backend,
+                    backend=active_resources.backend,
                     refiner=refiner,
                     output_dir=request_directory,
                     limits=limits,
@@ -499,7 +505,7 @@ def create_process_callback(
                 str(result.preview_path),
                 str(result.master_path),
                 str(result.matte_path),
-                _status(result, device=resources.device),
+                _status(result, device=active_resources.device),
             )
         except BaseException as exc:
             _cleanup_failed_request(request_directory)

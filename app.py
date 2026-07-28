@@ -50,20 +50,22 @@ def bootstrap_application(
     device = target_device_fn()
     active_zerogpu = zerogpu_detector()
     if active_zerogpu:
-        # ZeroGPU's torch patching leaves startup-time model construction with
-        # tensors split across cuda:0 (ZeroGPU) and cpu, and Meta's deepcopy-based
-        # cloning rejects the mixture. Building inside a GPU lease keeps
-        # construction single-device; weights migrate between CPU and GPU across
-        # leases. The lease duration is a cap and is released at return.
-        def preload_resources() -> Any:
-            return build_resources_fn(checkpoint, device=device, preload=True)
+        # GPU tasks run in a persistent worker process and only pickled values
+        # cross the boundary, so built models can never leave the worker. The
+        # first request builds them inside the worker; later requests reuse the
+        # resident ones. Startup therefore skips eager preload, and the request
+        # lease is sized to cover a one-time build plus one inference.
+        from sam3_matting.zerogpu_worker import get_or_build_resources
 
-        resources = gpu_factory(duration=240, size="xlarge")(preload_resources)()
+        def load_resources() -> Any:
+            return get_or_build_resources(str(checkpoint), device)
+
+        resources: Any = load_resources
     else:
         resources = build_resources_fn(checkpoint, device=device, preload=True)
     process = create_callback_fn(resources, zerogpu=active_zerogpu)
     validator = create_validator_fn(zerogpu=active_zerogpu)
-    accelerated_process = gpu_factory(duration=90, size="xlarge")(process)
+    accelerated_process = gpu_factory(duration=240, size="xlarge")(process)
     runtime_status = {
         "device": device.upper(),
         "cuda": "Active",

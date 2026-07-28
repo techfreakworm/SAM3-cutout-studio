@@ -20,7 +20,7 @@
 - SAM checkpoint SHA-256: `9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03`.
 - ViTMatte: `hustvl/vitmatte-small-composition-1k@6a58ad7646403c1df626fbd746900aec7361ea1d`.
 
-The Space preloads the exact SAM checkpoint and the ViTMatte `config.json`, `model.safetensors`, and `preprocessor_config.json` files. That describes Hub artifact caching, not per-request construction. Application startup eagerly materializes one SAM predictor and one ViTMatte model; queued requests reuse the resident process-wide instances.
+The Space preloads the exact SAM checkpoint and the ViTMatte `config.json`, `model.safetensors`, and `preprocessor_config.json` files. That describes Hub artifact caching, not per-request construction. On ZeroGPU, the first request builds one SAM predictor and one ViTMatte model inside the persistent GPU worker, and later requests reuse those resident instances; local CUDA startup eagerly materializes the same pair in module-level resources instead.
 
 ## Hosted and local deltas
 

@@ -176,6 +176,65 @@ def test_callback_has_exact_contract_and_wires_validated_job_config(tmp_path: Pa
     ) == (6, 6, 0.15, 0.99, 2.0)
 
 
+def test_callback_resolves_a_resources_provider_inside_each_call(tmp_path: Path) -> None:
+    backend = object()
+    refiner = FakeRefiner()
+    resources = ApplicationResources(backend=backend, refiner=refiner, device="cuda")
+    resolutions: list[ApplicationResources] = []
+    pipeline_calls: list[dict[str, object]] = []
+
+    def provider() -> ApplicationResources:
+        resolutions.append(resources)
+        return resources
+
+    def pipeline(source: str | Path, **kwargs: object) -> SimpleNamespace:
+        pipeline_calls.append(dict(kwargs))
+        output_dir = Path(kwargs["output_dir"])
+        return SimpleNamespace(
+            preview_path=output_dir / "preview.mp4",
+            master_path=output_dir / "master.mov",
+            matte_path=output_dir / "matte.mp4",
+            processed_frame_count=60,
+            effective_sam_prompt=("person",),
+            elapsed_seconds=1.0,
+        )
+
+    callback = create_process_callback(
+        provider,
+        zerogpu=True,
+        pipeline_fn=pipeline,
+        input_validator=lambda source, limits: _metadata(),
+        output_root=tmp_path,
+        progress_factory=ProgressRecorder,
+    )
+
+    callback("/uploads/shot.mp4", "person", 0.5, 8, 1, 6, 6, 0.15, 0.99, 2.0)
+    callback("/uploads/shot.mp4", "person", 0.5, 8, 1, 6, 6, 0.15, 0.99, 2.0)
+
+    assert resolutions == [resources, resources]
+    assert len(pipeline_calls) == 2
+    assert all(call["backend"] is backend for call in pipeline_calls)
+
+
+def test_worker_registry_builds_resources_once_per_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sam3_matting.zerogpu_worker as worker
+
+    builds: list[tuple[str, str]] = []
+    sentinel = object()
+    monkeypatch.setattr(worker, "_RESOURCES", None)
+
+    def fake_build(checkpoint: str, *, device: str, preload: bool) -> object:
+        builds.append((checkpoint, device))
+        assert preload is True
+        return sentinel
+
+    monkeypatch.setattr("sam3_matting.application.build_resources", fake_build)
+
+    assert worker.get_or_build_resources("/models/sam.safetensors", "cuda") is sentinel
+    assert worker.get_or_build_resources("/models/sam.safetensors", "cuda") is sentinel
+    assert builds == [("/models/sam.safetensors", "cuda")]
+
+
 def test_cached_refiner_settings_are_restored_between_jobs_and_after_failure(tmp_path: Path) -> None:
     refiner = FakeRefiner()
     resources = ApplicationResources(backend=object(), refiner=refiner, device="cuda")
