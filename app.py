@@ -65,7 +65,10 @@ def bootstrap_application(
         resources = build_resources_fn(checkpoint, device=device, preload=True)
     process = create_callback_fn(resources, zerogpu=active_zerogpu)
     validator = create_validator_fn(zerogpu=active_zerogpu)
-    accelerated_process = gpu_factory(duration=240, size="xlarge")(process)
+    # ZeroGPU accounts xlarge leases at 2x seconds against the per-call cap, so
+    # 120s requests 240 credits. That covers one-time model construction plus
+    # one inference (measured ~43s total on RTX PRO 6000).
+    accelerated_process = gpu_factory(duration=120, size="xlarge")(process)
     runtime_status = {
         "device": device.upper(),
         "cuda": "Active",

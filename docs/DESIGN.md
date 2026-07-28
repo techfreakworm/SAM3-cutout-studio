@@ -55,7 +55,7 @@ A one-hour Space `startup_duration_timeout` accommodates cold dependency and cac
 | Authentication | Hugging Face OAuth profile required | No app-level login |
 | Prompt clauses | 3 maximum | 4 maximum |
 | GPU allocation | xlarge, full 96 GB RTX PRO 6000 Blackwell slice | Operator GPU |
-| GPU duration request | 90 seconds | Not applicable |
+| GPU duration request | 120 seconds | Not applicable |
 | Upload launch/validation cap | 100 MiB | 2 GiB |
 | Video duration | 2.0 seconds | 120 seconds |
 | Frame count | 60 | 7,200 |

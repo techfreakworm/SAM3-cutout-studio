@@ -33,7 +33,7 @@ Parity settings are shared, but deployment admission policy differs deliberately
 | Input envelope | 2.0 s, 60 frames, 30 fps, long edge <= 1920 and short edge <= 1080 | 120 s, 7,200 frames, 60 fps, width/height <= 4096 |
 | Login | Hugging Face OAuth profile required | none at app level |
 | Gradio API | disabled with `api_open=False` | disabled with `api_open=False` |
-| GPU boundary | xlarge 96 GB ZeroGPU, 90-second duration request | operator CUDA device |
+| GPU boundary | xlarge 96 GB ZeroGPU, 120-second duration request | operator CUDA device |
 
 These limits determine whether a request is admitted; they do not alter the accepted request's tracking, trimap, ViTMatte, compositing, or encoding values.
 
