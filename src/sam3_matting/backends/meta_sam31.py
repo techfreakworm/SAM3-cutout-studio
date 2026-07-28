@@ -6,7 +6,6 @@ import io
 import logging
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from pathlib import Path
 from threading import Lock
 
 import numpy as np
@@ -110,6 +109,23 @@ def _adapt_legacy_state_offload(predictor: object) -> object:
     return predictor
 
 
+def _is_safetensors_checkpoint(checkpoint_path: str) -> bool:
+    """Detect the safetensors container by filename or content.
+
+    Xet-backed Hub downloads resolve to content-addressed blob paths that drop
+    the filename suffix, so the header is sniffed when the suffix is absent.
+    """
+    if checkpoint_path.endswith(".safetensors"):
+        return True
+    try:
+        with open(checkpoint_path, "rb") as handle:
+            prefix = handle.read(9)
+    except OSError:
+        return False
+    # safetensors: 8-byte little-endian JSON header length, then '{'.
+    return len(prefix) == 9 and prefix[8:] == b"{" and not prefix.startswith(b"PK\x03\x04")
+
+
 def _default_predictor_builder(**kwargs: object) -> object:
     try:
         from sam3.model_builder import build_sam3_multiplex_video_predictor
@@ -117,7 +133,7 @@ def _default_predictor_builder(**kwargs: object) -> object:
         raise RuntimeError("Meta SAM 3.1 is not installed; install the pinned sam3 dependency") from exc
 
     checkpoint_path = str(kwargs["checkpoint_path"])
-    if Path(checkpoint_path).suffix == ".safetensors":
+    if _is_safetensors_checkpoint(checkpoint_path):
         from safetensors.torch import load_model
 
         builder_kwargs = dict(kwargs)

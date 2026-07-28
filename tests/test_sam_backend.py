@@ -1234,6 +1234,56 @@ def test_public_safetensors_builder_rejects_missing_learned_weights() -> None:
         )
 
 
+def test_safetensors_checkpoint_detection_uses_suffix_then_content(tmp_path: Path) -> None:
+    from sam3_matting.backends.meta_sam31 import _is_safetensors_checkpoint
+
+    # The suffix fast-path never touches the filesystem.
+    assert _is_safetensors_checkpoint("/nonexistent/model.safetensors") is True
+
+    # Xet-backed Hub cache entries are content-addressed blobs without a suffix.
+    blob = tmp_path / "9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03"
+    blob.write_bytes((2).to_bytes(8, "little") + b"{}" + b"\x00" * 4)
+    assert _is_safetensors_checkpoint(str(blob)) is True
+
+    torch_zip = tmp_path / "weights"
+    torch_zip.write_bytes(b"PK\x03\x04" + b"\x00" * 12)
+    assert _is_safetensors_checkpoint(str(torch_zip)) is False
+
+    assert _is_safetensors_checkpoint(str(tmp_path / "absent")) is False
+
+
+def test_default_predictor_builder_routes_xet_blob_paths_to_safetensors_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import sam3.model_builder as upstream_builder
+
+    import sam3_matting.backends.meta_sam31 as backend_module
+
+    blob = tmp_path / "9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03"
+    blob.write_bytes((2).to_bytes(8, "little") + b"{}")
+
+    safetensors_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    direct_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        backend_module,
+        "_build_safetensors_predictor",
+        lambda *args, **kwargs: safetensors_calls.append((args, kwargs)) or object(),
+    )
+    monkeypatch.setattr(
+        upstream_builder,
+        "build_sam3_multiplex_video_predictor",
+        lambda **kwargs: direct_calls.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(backend_module, "_adapt_legacy_state_offload", lambda predictor: predictor)
+
+    backend_module._default_predictor_builder(checkpoint_path=str(blob))
+
+    assert [call[0][0] for call in safetensors_calls] == [str(blob)]
+    assert direct_calls == []
+
+
 def _upstream_session_predictor_without_state_offload():
     from sam3.model.sam3_base_predictor import Sam3BasePredictor
 
