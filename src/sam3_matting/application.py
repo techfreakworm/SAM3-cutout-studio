@@ -513,6 +513,9 @@ def create_process_callback(
                 raise
             incident_id = incident_id_factory()
             _LOGGER.exception("Inference failed [incident %s]", incident_id)
-            raise error_factory(f"Could not process this video. Reference: {incident_id}") from exc
+            message = f"Could not process this video. Reference: {incident_id}"
+            if os.environ.get("SAM3_DEBUG_ERRORS"):
+                message += f" (debug: {type(exc).__name__}: {str(exc)[:180]})"
+            raise error_factory(message) from exc
 
     return process
